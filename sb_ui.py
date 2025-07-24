@@ -101,6 +101,7 @@ class TranscriptUI:
             return
 
         bullet = f"• {last}"
+        
         if self.partial_history:
             prev = self.partial_history[-1]
             import difflib
@@ -128,6 +129,7 @@ class TranscriptUI:
         attach = self._find_attachment_point(self.final_words, new_words)
         self.final_words = self.final_words[:attach] + new_words
         joined = self._format_paragraph(self.final_words)
+
         self.final_box.text = joined
         self.final_box.buffer.cursor_position = len(joined)
         self.app.invalidate()
