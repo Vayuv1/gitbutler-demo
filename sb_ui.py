@@ -87,7 +87,7 @@ class TranscriptUI:
 
     def update_partial(self, new_text: str):
         """Display latest sentence fragment as a bullet point."""
-        text = new_text.strip()
+        text = new_text.strip().lower()
 
         if not text:
             if not self.partial_box.text.strip():
@@ -101,10 +101,16 @@ class TranscriptUI:
             return
 
         bullet = f"• {last}"
-        if self.partial_history and self.partial_history[-1] == bullet:
-            return
+        if self.partial_history:
+            prev = self.partial_history[-1]
+            import difflib
+            if difflib.SequenceMatcher(None, prev[2:], last).ratio() > 0.8:
+                self.partial_history[-1] = bullet
+            else:
+                self.partial_history.append(bullet)
+        else:
+            self.partial_history.append(bullet)
 
-        self.partial_history.append(bullet)
         if len(self.partial_history) > 20:
             self.partial_history = self.partial_history[-20:]
 
@@ -118,16 +124,24 @@ class TranscriptUI:
     def update_final(self, text: str):
         if not text:
             return
-        new_words = text.strip().split()
+        new_words = self._clean_words(text)
         attach = self._find_attachment_point(self.final_words, new_words)
         self.final_words = self.final_words[:attach] + new_words
-        joined = " ".join(self.final_words)
+        joined = self._format_paragraph(self.final_words)
         self.final_box.text = joined
         self.final_box.buffer.cursor_position = len(joined)
         self.app.invalidate()
 
     def update_level(self, level: float):
         self.audio_meter.update_level(level)
+
+    def _clean_words(self, text: str):
+        words = text.lower().split()
+        cleaned = []
+        for w in words:
+            if not cleaned or w != cleaned[-1]:
+                cleaned.append(w)
+        return cleaned
 
     @staticmethod
     def _find_attachment_point(existing, new):
@@ -141,6 +155,17 @@ class TranscriptUI:
                 if search[i:i + length] == prefix:
                     return len(existing) - len(search) + i
         return len(existing)
+
+    @staticmethod
+    def _format_paragraph(words, per_sentence=12):
+        sentences = []
+        for i in range(0, len(words), per_sentence):
+            sentence = " ".join(words[i:i+per_sentence]).strip()
+            if sentence:
+                sentences.append(sentence)
+        if not sentences:
+            return ""
+        return ". ".join(sentences) + "."
 
     def run(self):
         self.app.run()
