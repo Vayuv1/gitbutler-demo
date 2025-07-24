@@ -7,38 +7,69 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 import os
 import textwrap
+import re
+
+
+class AudioMeter(TextArea):
+    """Simple horizontal audio level meter."""
+
+    def __init__(self, **kwargs):
+        super().__init__(read_only=True, multiline=False, wrap_lines=False,
+                         height=1, **kwargs)
+        self.text = ""
+        self.max_width = 78  # Adjust according to terminal width
+        self.app = None
+
+    def update_level(self, level: float):
+        bars = int(level * self.max_width)
+        self.text = "▮" * bars
+        if self.app:
+            self.app.invalidate()
 
 class TranscriptUI:
-    def __init__(self):
-        # UI sections
-        self.partial_box = TextArea(style="class:partial", scrollbar=True, multiline=True, wrap_lines=True)
-        self.final_box = TextArea(style="class:final", scrollbar=True, multiline=True, wrap_lines=True)
+    """UI for displaying partial and final transcripts."""
 
-        # Style
+    def __init__(self):
+        self.partial_box = TextArea(style="class:partial", scrollbar=True,
+                                    multiline=True, wrap_lines=True)
+        self.final_box = TextArea(style="class:final", scrollbar=True,
+                                  multiline=True, wrap_lines=True)
+        self.audio_meter = AudioMeter(style="class:meter")
+
         self.style = Style.from_dict({
+            "header": "bold underline",
             "partial": "fg:cyan",
             "final": "fg:green",
-            "title": "bold underline",
+            "meter": "fg:yellow bg:black",
         })
 
-        # Keybindings
         self.kb = KeyBindings()
         self.kb.add("c-c")(self._exit)
         self.kb.add("c-s")(self._save)
 
-        # History
         self.partial_history = []
         self.final_words = []
+        self.last_partial_display = "• ..."
 
-        # Layout
         self.layout = Layout(HSplit([
-            TextArea(text="Partial Transcript", style="class:title", height=1, focusable=False),
+            TextArea(text="\U0001F539 Partial Transcript Updates",
+                     style="class:header", height=1, focusable=False),
             self.partial_box,
-            TextArea(text="Final Transcript", style="class:title", height=1, focusable=False),
+            TextArea(text="\U0001F538 Final Transcript Paragraph",
+                     style="class:header", height=1, focusable=False),
             self.final_box,
+            TextArea(text="\U0001F4C9 Audio Input Level",
+                     style="class:header", height=1, focusable=False),
+            self.audio_meter,
         ]))
 
-        self.app = Application(layout=self.layout, key_bindings=self.kb, full_screen=True, style=self.style)
+        self.app = Application(layout=self.layout, key_bindings=self.kb,
+                               full_screen=True, style=self.style)
+
+        # Assign the app so widgets can trigger redraws
+        self.partial_box.app = self.app
+        self.final_box.app = self.app
+        self.audio_meter.app = self.app
 
     def _exit(self, event):
         self._save_to_file("transcript.txt")
@@ -54,31 +85,62 @@ class TranscriptUI:
             wrapped = textwrap.fill(" ".join(self.final_words), width=80)
             f.write(wrapped)
 
-    def update_partial(self, new_text):
+    def update_partial(self, new_text: str):
+        """Display latest sentence fragment as a bullet point."""
         text = new_text.strip()
-        if not text:
-            return
-        self.partial_history.append(text)
-        if len(self.partial_history) > 10:
-            self.partial_history.pop(0)
-        self.partial_box.text = "\n".join(self.partial_history)
-        self.partial_box.buffer.cursor_position = len(self.partial_box.text)
 
-    def update_final(self, text):
+        if not text:
+            if not self.partial_box.text.strip():
+                self.partial_box.text = self.last_partial_display
+                self.partial_box.buffer.cursor_position = len(self.last_partial_display)
+            return
+
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        last = sentences[-1].strip()
+        if not last:
+            return
+
+        bullet = f"• {last}"
+        if self.partial_history and self.partial_history[-1] == bullet:
+            return
+
+        self.partial_history.append(bullet)
+        if len(self.partial_history) > 20:
+            self.partial_history = self.partial_history[-20:]
+
+        updated = "\n".join(self.partial_history)
+        if updated != self.partial_box.text:
+            self.partial_box.text = updated
+            self.partial_box.buffer.cursor_position = len(updated)
+            self.last_partial_display = updated
+            self.app.invalidate()
+
+    def update_final(self, text: str):
         if not text:
             return
-        words = text.strip().split()
-        self.final_words = self._merge_overlap(self.final_words, words)
+        new_words = text.strip().split()
+        attach = self._find_attachment_point(self.final_words, new_words)
+        self.final_words = self.final_words[:attach] + new_words
         joined = " ".join(self.final_words)
         self.final_box.text = joined
         self.final_box.buffer.cursor_position = len(joined)
+        self.app.invalidate()
 
-    def _merge_overlap(self, current, incoming):
-        overlap = 0
-        for i in range(1, min(len(current), len(incoming)) + 1):
-            if current[-i:] == incoming[:i]:
-                overlap = i
-        return current + incoming[overlap:]
+    def update_level(self, level: float):
+        self.audio_meter.update_level(level)
+
+    @staticmethod
+    def _find_attachment_point(existing, new):
+        if not existing or not new:
+            return len(existing)
+
+        for length in range(len(new), 0, -1):
+            prefix = new[:length]
+            search = existing[-(len(new) + 10):]
+            for i in range(len(search)):
+                if search[i:i + length] == prefix:
+                    return len(existing) - len(search) + i
+        return len(existing)
 
     def run(self):
         self.app.run()
