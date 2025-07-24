@@ -84,6 +84,7 @@ def _normalize(text: str) -> str:
     """Normalize text by lowercasing and removing duplicated words."""
     words = text.lower().split()
     cleaned: list[str] = []
+
     for w in words:
         if not cleaned or w != cleaned[-1]:
             cleaned.append(w)
