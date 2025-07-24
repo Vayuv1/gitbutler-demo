@@ -56,8 +56,22 @@ def _find_pulseaudio_monitor_device():
             return i
     return None
 
-def _is_similar(new, old):
-    return difflib.SequenceMatcher(None, new, old).ratio() > SIMILARITY_THRESHOLD
+def _normalize(text: str) -> str:
+    """Lowercase and remove immediate duplicate words."""
+    words = text.lower().split()
+    cleaned = []
+    for w in words:
+        if not cleaned or w != cleaned[-1]:
+            cleaned.append(w)
+    return " ".join(cleaned)
+
+
+def _is_similar(new: str, old: str) -> bool:
+    """Check similarity ignoring case and duplicate words."""
+    return (
+        difflib.SequenceMatcher(None, _normalize(new), _normalize(old)).ratio()
+        > SIMILARITY_THRESHOLD
+    )
 
 # ─── Transcription Core ───────────────────────────────────────────
 
@@ -79,6 +93,7 @@ def _process_window():
             text = " ".join(prediction[0])
         else:
             text = prediction[0].strip()
+        text = _normalize(text)
 
         if not text or len(text.split()) < MIN_WORD_COUNT:
             return
@@ -95,6 +110,7 @@ def _process_window():
                     overlap = i
             if overlap > 0:
                 text = " ".join(curr[overlap:])
+                text = _normalize(text)
 
         ui.update_partial(text)
         ui.update_final(text)
