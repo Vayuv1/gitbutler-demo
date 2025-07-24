@@ -10,10 +10,10 @@ from speechbrain.inference.ASR import EncoderDecoderASR
 # Configuration
 SAMPLE_RATE = 16000
 WINDOW_DURATION = 5.0
-HOP_DURATION = 5.0
+HOP_DURATION = 0.5
 LOOKBACK_SIZE = int(SAMPLE_RATE * 2.0)  # 2s context
 MIN_ENERGY = 0.01
-MIN_WORD_COUNT = 3
+MIN_WORD_COUNT = 2
 SIMILARITY_THRESHOLD = 0.9
 
 WINDOW_SIZE = int(SAMPLE_RATE * WINDOW_DURATION)
@@ -113,6 +113,7 @@ def transcribe_from_mic(device_index=None):
         sliding_buffer.extend(indata[:, 0].tolist())
         if len(sliding_buffer) > WINDOW_SIZE:
             del sliding_buffer[:len(sliding_buffer) - WINDOW_SIZE]
+        ui.update_level(float(np.mean(np.abs(indata))))
         _process_window()
 
     with sd.InputStream(
@@ -157,6 +158,7 @@ def transcribe_from_file(filepath):
             sliding_buffer.extend(chunk.tolist())
             if len(sliding_buffer) > WINDOW_SIZE:
                 del sliding_buffer[:len(sliding_buffer) - WINDOW_SIZE]
+            ui.update_level(float(np.mean(np.abs(chunk))))
             _process_window()
             time.sleep(HOP_DURATION)
 
