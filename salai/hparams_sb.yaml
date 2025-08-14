@@ -1,0 +1,39 @@
+# asr_finetune/speechbrain/hparams_sb.yaml
+# SpeechBrain 1.x Conformer-CTC baseline (SpecAugment off for now)
+
+# -------- Features --------
+sample_rate: 16000
+n_mels: 80
+compute_features: !new:speechbrain.lobes.features.Fbank
+  n_mels: !ref <n_mels>
+  sample_rate: !ref <sample_rate>
+  n_fft: 400
+  win_length: 400   # 25 ms at 16 kHz
+  hop_length: 160   # 10 ms at 16 kHz
+
+# -------- Normalization / Augmentation --------
+normalize: !new:speechbrain.processing.features.InputNormalization
+  norm_type: global
+
+# keep training unblocked; we can re-enable 1.x Augmenter later
+specaug: null
+
+log_softmax: !name:torch.nn.functional.log_softmax
+  dim: -1
+
+# -------- Model (SB 1.x path) --------
+encoder: !new:speechbrain.lobes.models.transformer.Conformer.ConformerEncoder
+  num_layers: 12
+  d_model: 256
+  d_ffn: 1024
+  nhead: 4
+  kernel_size: 31
+  dropout: 0.1
+  attention_type: regularMHA  # avoids needing pos_embs in forward
+
+ctc_lin: !new:torch.nn.Linear
+  in_features: 256
+  out_features: 40  # resized to tokenizer vocab at runtime
+
+ctc_cost: !name:speechbrain.nnet.losses.ctc_loss
+  blank_index: 0
