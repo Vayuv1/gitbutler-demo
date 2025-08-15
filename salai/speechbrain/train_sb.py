@@ -1,418 +1,472 @@
-import argparse
-import csv
-import json
-import os
-import time
-from dataclasses import dataclass
-from typing import Optional, List
+# salai/asr_finetune/speechbrain/train_sb.py
+"""
+This script is the main entry point for training a SpeechBrain ASR model.
+It handles everything from argument parsing and data loading to training,
+validation, and artifact generation.
+"""
 
+import argparse
+import os
+import json
+import time
 import torch
-import torch.nn as nn
+import logging
+import pandas as pd
+import sys
+from datetime import datetime
+from pathlib import Path
 
 import speechbrain as sb
-from speechbrain.dataio.sampler import DynamicBatchSampler
 from speechbrain.dataio.dataset import DynamicItemDataset
-from speechbrain.dataio.encoder import CTCTextEncoder
-from speechbrain.decoders.ctc import CTCBeamSearcher, ctc_greedy_decode
+from speechbrain.dataio.sampler import DynamicBatchSampler
+from torch.utils.data import DataLoader
+from speechbrain.utils.distributed import run_on_main
 from hyperpyyaml import load_hyperpyyaml
+from speechbrain.tokenizers.SentencePiece import SentencePiece
+from speechbrain.utils.metric_stats import ErrorRateStats
+from torch.optim import AdamW
+from speechbrain.utils.seed import seed_everything
 
-try:
-    from .sb_utils import build_model_from_hparams
-    from ..common.text_norm import normalize_atc_text
-    from ..common.metrics import compute_wer
-except Exception:
-    import sys, pathlib
-    sys.path.append(str(pathlib.Path(__file__).resolve().parents[2]))
-    from asr_finetune.speechbrain.sb_utils import (
-    build_model_from_hparams,
-    inject_lora_adapters,
+# Add project root to path for imports
+project_root = Path(__file__).resolve().parent.parent.parent
+sys.path.append(str(project_root))
+
+from asr_finetune.speechbrain.sb_utils import (
+    build_asr_model,
     save_model_card,
-    )
-    from asr_finetune.common.text_norm import normalize_atc_text
-    from asr_finetune.common.metrics import compute_wer
+    inject_lora,
+    create_char_tokenizer,
+)
+from asr_finetune.common.text_norm import normalize_transcript
+from asr_finetune.common.logging_utils import (
+    get_git_commit_hash,
+    log_gpu_memory,
+    get_peak_memory_mb,
+)
+
+logger = logging.getLogger(__name__)
 
 
-@dataclass
-class SBArgs:
-    # Data
-    train_manifest: str
-    valid_manifest: str
-    test_manifest: Optional[str]
-    output_dir: str
-    dataset_part: str
-    train_fraction: float
-    validation_samples: int
-    train_subset: int
-    skip_test: bool
-    # Optimization
-    epochs: int
-    lr: float
-    batch_size: int
-    grad_accum: int
-    seed: int
-    # Model
-    model_name: str
-    hparams_file: str
-    # Tokenizer
-    tokenizer_type: str  # 'char' or 'spm'
-    spm_model: Optional[str]
-    # PEFT
-    peft: str  # 'none' or 'lora'
-    lora_r: int
-    lora_alpha: int
-    lora_dropout: float
-    # Decode
-    beam_size: int
-    lm_weight: float
-    # Logging / meta
-    run_id: Optional[str]
-    run_stage: Optional[str]
-    metrics_csv: Optional[str]
-    notes: str
-    save_full_model: bool
-    language: str
-    task: str
-    eval_strategy: str
-    eval_steps: Optional[int]
+class ASR(sb.Brain):
+    """
+    Main class for ASR training and evaluation.
+    """
 
-
-class ASRBrain(sb.Brain):
     def compute_forward(self, batch, stage):
+        """
+        Forward pass of the model.
+        """
         batch = batch.to(self.device)
         wavs, wav_lens = batch.sig
         feats = self.hparams.compute_features(wavs)
-        feats = self.hparams.normalize(feats, wav_lens)
-        if self.hparams.specaug is not None and stage == sb.Stage.TRAIN:
-            feats = self.hparams.specaug(feats, wav_lens)
-        enc_out = self.modules.encoder(feats)
-        if isinstance(enc_out, tuple):
-            enc_out = enc_out[0]
-        logits = self.modules.ctc_lin(enc_out)
+
+        # Augmentation
+        if stage == sb.Stage.TRAIN and hasattr(self.hparams, "augmenter"):
+            feats, wav_lens = self.hparams.augmenter(feats, wav_lens)
+
+        # Project features to model dimension
+        feats = self.modules.input_linear(feats)
+
+        # Model forward
+        out, _ = self.modules.model(feats)  # ConformerEncoder returns (x, attn)
+        logits = self.modules.ctc_lin(out)
         p_ctc = self.hparams.log_softmax(logits)
+
         return p_ctc, wav_lens
 
-    def _indices_to_text(self, idx_seqs: List[List[int]]) -> List[str]:
-        # Convert index sequences to text using encoder's symbol list
-        vocab = self.hparams.label_encoder.ind2lab
-        return ["".join(vocab[i] for i in seq) for seq in idx_seqs]
-
     def compute_objectives(self, predictions, batch, stage):
+        """
+        Computes the loss.
+        """
         p_ctc, wav_lens = predictions
-        tokens, tokens_lens = batch.tokens, batch.tokens_lens
-        ctc_loss = self.hparams.ctc_cost(
-            p_ctc,
-            tokens,
-            wav_lens,
-            tokens_lens,
-        )
+        ids = batch.id
+        tokens, tokens_lens = batch.tokens
+
+        loss = self.hparams.ctc_loss(p_ctc, tokens, wav_lens, tokens_lens)
+
         if stage != sb.Stage.TRAIN:
-            if self.hparams.val_beam_size and self.hparams.val_beam_size > 1:
-                beams_per_utt = self.hparams.ctc_beam_searcher(p_ctc, wav_lens)
-                hyps = [beams[0].text for beams in beams_per_utt]  # top-1 text
-            else:
-                # Greedy with proper CTC collapsing
-                idxs = ctc_greedy_decode(p_ctc, wav_lens, blank_id=self.hparams.label_encoder.get_blank_index())
-                hyps = self._indices_to_text(idxs)
+            # Decode the outputs for WER/CER calculation
+            predicted_tokens = p_ctc.argmax(dim=-1, keepdim=False)
+            predicted_words = self.hparams.tokenizer.decode_ndim(
+                predicted_tokens)
 
-            # Build references as strings
-            refs = []
-            vocab = self.hparams.label_encoder.ind2lab
-            for t, l in zip(batch.tokens, batch.tokens_lens):
-                ids = t[: int(l)].tolist()
-                refs.append("".join(vocab[i] for i in ids))
+            target_words = batch.words
+            self.wer_metric.append(ids, predicted_words, target_words)
+            self.cer_metric.append(ids, predicted_words, target_words)
 
-            self.wer_metric.append(batch.id, hyps, refs)
-        return ctc_loss
+        return loss
+
+    def fit_batch(self, batch):
+        """
+        Overrides fit_batch to implement gradient accumulation and step-based evaluation.
+        """
+        # Managing automatic mixed precision
+        if self.auto_mix_prec:
+            with torch.autocast(torch.device(self.device).type):
+                outputs = self.compute_forward(batch, sb.Stage.TRAIN)
+            loss = self.compute_objectives(outputs, batch, sb.Stage.TRAIN)
+            self.scaler.scale(loss / self.hparams.grad_accum_steps).backward()
+            if self.step % self.hparams.grad_accum_steps == 0:
+                self.scaler.unscale_(self.optimizer)
+                if self.check_gradients():
+                    self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad()
+        else:
+            outputs = self.compute_forward(batch, sb.Stage.TRAIN)
+            loss = self.compute_objectives(outputs, batch, sb.Stage.TRAIN)
+            (loss / self.hparams.grad_accum_steps).backward()
+            if self.step % self.hparams.grad_accum_steps == 0:
+                if self.check_gradients():
+                    self.optimizer.step()
+                self.optimizer.zero_grad()
+
+        # Step-based evaluation
+        if self.hparams.eval_strategy == "steps" and self.step % self.hparams.eval_steps == 0 and self.step > 0:
+            logger.info(f"Running validation at step {self.step}")
+            self.evaluate(self.hparams.valid_set, min_key="WER")
+
+        return loss.detach()
 
     def on_stage_start(self, stage, epoch=None):
-        if stage != sb.Stage.TRAIN:
-            self.wer_metric = sb.utils.metric_stats.ErrorRateStats()
+        """
+        Gets called at the beginning of each epoch.
+        """
+        self.wer_metric = ErrorRateStats()
+        self.cer_metric = ErrorRateStats(split_tokens=True)
 
     def on_stage_end(self, stage, stage_loss, epoch=None):
+        """
+        Gets called at the end of an epoch.
+        """
+        stage_stats = {"loss": stage_loss}
         if stage == sb.Stage.TRAIN:
-            self.hparams._last_train_loss = float(stage_loss)
-        if stage == sb.Stage.VALID:
-            self.hparams._last_valid_loss = float(stage_loss)
-        return super().on_stage_end(stage, stage_loss, epoch)
+            self.train_stats = stage_stats
+
+        elif stage == sb.Stage.VALID:
+            wer = self.wer_metric.summarize("error_rate")
+            cer = self.cer_metric.summarize("error_rate")
+            stage_stats["WER"] = wer
+            stage_stats["CER"] = cer
+
+            self.hparams.train_logger.log_stats(
+                stats_meta={"epoch": epoch, "step": self.step},
+                train_stats=self.train_stats,
+                valid_stats=stage_stats,
+            )
+            self.checkpointer.save_and_keep_only(
+                meta={"WER": wer}, min_keys=["WER"]
+            )
+            self.valid_stats = stage_stats  # Save for final logging
+
+        elif stage == sb.Stage.TEST:
+            wer = self.wer_metric.summarize("error_rate")
+            cer = self.cer_metric.summarize("error_rate")
+            stage_stats["WER"] = wer
+            stage_stats["CER"] = cer
+
+            self.hparams.train_logger.log_stats(
+                stats_meta={"Epoch loaded": self.hparams.epoch_counter.current},
+                test_stats=stage_stats,
+            )
+            if hasattr(self.hparams, "wer_file") and self.hparams.wer_file:
+                with open(self.hparams.wer_file, "w") as w:
+                    self.wer_metric.write_stats(w)
+            self.test_stats = stage_stats
 
 
-def _read_manifest(path):
-    items = []
-    if path.endswith(".json") or path.endswith(".jsonl"):
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                items.append(json.loads(line))
-    else:
-        import pandas as pd
-        df = pd.read_csv(path)
-        items = df.to_dict("records")
-    return items
-
-
-def _to_dataset(items, tokenizer):
-    # Convert list[dict] -> dict[id] = {wav, transcript, ...}  (no 'id' field inside)
-    data = {}
-    for ex in items:
-        ex_id = str(ex["id"])
-        data[ex_id] = {k: v for k, v in ex.items() if k != "id"}
-
-    ds = DynamicItemDataset(data)
+def dataio_prepare(hparams, tokenizer):
+    """
+    Prepares the data for training.
+    """
 
     @sb.utils.data_pipeline.takes("wav")
-    @sb.utils.data_pipeline.provides("sig", "sig_len")
-    def audio_pipeline(wav_path):
-        import torchaudio
-        sig, sr = torchaudio.load(wav_path)
-        if sr != 16000:
-            sig = torchaudio.functional.resample(sig, sr, 16000)
-            sr = 16000
-        if sig.shape[0] > 1:
-            sig = torch.mean(sig, dim=0, keepdim=True)
-        sig = sig.squeeze(0)
-        return sig, torch.tensor([sig.shape[-1] / sr], dtype=torch.float32)
+    @sb.utils.data_pipeline.provides("sig")
+    def audio_pipeline(wav):
+        return sb.dataio.dataio.read_audio(wav)
 
     @sb.utils.data_pipeline.takes("transcript")
-    @sb.utils.data_pipeline.provides("tokens", "tokens_lens")
-    def text_pipeline(text):
-        norm = normalize_atc_text(text)
-        ids = tokenizer.encode_sequence(norm)
-        encoded = torch.tensor(ids, dtype=torch.long)
-        return encoded, torch.tensor([len(ids)], dtype=torch.long)
+    @sb.utils.data_pipeline.provides("words", "tokens")
+    def text_pipeline(transcript):
+        words = normalize_transcript(transcript)
+        tokens_list = tokenizer.encode_sequence(words)
+        tokens = torch.LongTensor(tokens_list)
+        return words, tokens
 
-    ds.add_dynamic_item(audio_pipeline)
-    ds.add_dynamic_item(text_pipeline)
-    # 'id' is the reserved key; you can request it as an output
-    ds.set_output_keys(["id", "sig", "tokens", "tokens_lens"])
-    return ds
+    datasets = {}
+    manifests = {
+        "train": hparams["train_manifest"],
+        "valid": hparams["valid_manifest"],
+        "test": hparams.get("test_manifest")
+    }
 
-def load_datasets(train_path: str, valid_path: str, test_path: Optional[str], tokenizer: CTCTextEncoder, train_subset: int = 0):
-    train_items = _read_manifest(train_path)
-    valid_items = _read_manifest(valid_path)
-    test_items = _read_manifest(test_path) if test_path else None
+    for key, manifest_path in manifests.items():
+        if manifest_path:
+            datasets[key] = DynamicItemDataset.from_csv(
+                csv_path=manifest_path,
+                replacements={"data_root": ""},
+            )
+            datasets[key].add_dynamic_item(audio_pipeline)
+            datasets[key].add_dynamic_item(text_pipeline)
+            datasets[key].set_output_keys(
+                ["id", "sig", "words", "tokens", "duration"])
+        else:
+            datasets[key] = None
 
-    if train_subset and train_subset > 0:
-        train_items = train_items[:train_subset]
+    if hparams.get("train_subset") and datasets["train"]:
+        datasets["train"] = datasets["train"].filtered_sorted(
+            sort_key="duration",
+            select_n=hparams["train_subset"]
+        )
 
-    train_ds = _to_dataset(train_items, tokenizer)
-    valid_ds = _to_dataset(valid_items, tokenizer)
-    test_ds = _to_dataset(test_items, tokenizer) if test_items else None
-    return train_ds, valid_ds, test_ds
+    return datasets["train"], datasets["valid"], datasets["test"]
 
 
-def make_tokenizer(tokenizer_type: str, spm_model: Optional[str]) -> CTCTextEncoder:
-    enc = CTCTextEncoder()
-    if tokenizer_type == "char":
-        symbols = [" "] + [chr(c) for c in range(65, 91)] + [str(d) for d in range(10)] + [".", "/"]
-        enc.update_from_iterable(symbols)
-        enc.insert_blank(index=0)  # <-- critical for CTC
-    elif tokenizer_type == "spm":
-        if not spm_model:
-            raise ValueError("SentencePiece model path required for tokenizer_type=spm")
-        import sentencepiece as spm
-        sp = spm.SentencePieceProcessor(model_file=spm_model)
-        for i in range(sp.get_piece_size()):
-            enc.update_from_iterable([sp.id_to_piece(i)])
-        enc.sp_model = sp
-        enc.insert_blank(index=0)
-    else:
-        raise ValueError("tokenizer_type must be 'char' or 'spm'")
-    return enc
+def setup_logging(log_file):
+    """Configure logging to file and console."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] - %(message)s",
+        handlers=[
+            logging.FileHandler(log_file, mode='w'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
 
 
 def main():
-    p = argparse.ArgumentParser()
-    # Data
-    p.add_argument("--train_manifest", required=True)
-    p.add_argument("--valid_manifest", required=True)
-    p.add_argument("--test_manifest", default=None)
-    p.add_argument("--output_dir", required=True)
-    p.add_argument("--dataset_part", default="base")
-    p.add_argument("--train_fraction", type=float, default=1.0)
-    p.add_argument("--validation_samples", type=int, default=0)
-    p.add_argument("--train_subset", type=int, default=0)
-    p.add_argument("--skip_test", action="store_true")
-    # Optimization
-    p.add_argument("--epochs", type=int, default=5)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--grad_accum", type=int, default=1)
-    p.add_argument("--seed", type=int, default=42)
-    # Model
-    p.add_argument("--model_name", default="sb-conformer-ctc")
-    p.add_argument("--hparams_file", default=os.path.join(os.path.dirname(__file__), "hparams_sb.yaml"))
-    # Tokenizer
-    p.add_argument("--tokenizer_type", choices=["char", "spm"], default="char")
-    p.add_argument("--spm_model", default=None)
-    # PEFT
-    p.add_argument("--peft", choices=["none", "lora"], default="none")
-    p.add_argument("--lora_r", type=int, default=32)
-    p.add_argument("--lora_alpha", type=int, default=64)
-    p.add_argument("--lora_dropout", type=float, default=0.05)
-    # Decode
-    p.add_argument("--beam_size", type=int, default=8)
-    p.add_argument("--lm_weight", type=float, default=0.0)
-    # Logging/meta
-    p.add_argument("--run_id", default=None)
-    p.add_argument("--run_stage", default="single")
-    p.add_argument("--metrics_csv", default=None)
-    p.add_argument("--notes", default="")
-    p.add_argument("--save_full_model", action="store_true")
-    p.add_argument("--language", default="en")
-    p.add_argument("--task", default="transcribe")
-    p.add_argument("--eval_strategy", default="epoch")
-    p.add_argument("--eval_steps", type=int, default=None)
+    parser = argparse.ArgumentParser(description="SpeechBrain ASR Finetuning")
 
-    args = p.parse_args()
-    torch.manual_seed(args.seed)
+    # Data args
+    parser.add_argument("--train_manifest", type=str, required=True,
+                        help="Path to the training manifest CSV.")
+    parser.add_argument("--valid_manifest", type=str, required=True,
+                        help="Path to the validation manifest CSV.")
+    parser.add_argument("--test_manifest", type=str, default=None,
+                        help="Path to the test manifest CSV.")
+    parser.add_argument("--dataset_part", type=str, required=True,
+                        help="Name of the dataset part (e.g., 'base', 'part2').")
+    parser.add_argument("--train_subset", type=int, default=None,
+                        help="Use a small subset of the training data for quick runs.")
+    parser.add_argument("--skip_test", action="store_true",
+                        help="Skip the final test set evaluation.")
 
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    run_id = args.run_id or ts
+    # Optimization args
+    parser.add_argument("--epochs", type=int, default=15,
+                        help="Number of training epochs.")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
+    parser.add_argument("--batch_size", type=int, default=16,
+                        help="Effective batch size.")
+    parser.add_argument("--grad_accum", type=int, default=1,
+                        help="Gradient accumulation steps.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    run_dir = os.path.join(args.output_dir, f"{args.model_name}_{run_id}")
-    os.makedirs(run_dir, exist_ok=True)
+    # Model args
+    parser.add_argument("--model_name", type=str, default="conformer-ctc",
+                        help="Name of the model for saving.")
+    parser.add_argument("--hparams_file", type=str,
+                        default="asr_finetune/speechbrain/hparams_sb.yaml",
+                        help="Path to the hyperparameters file.")
 
-    # Load YAML hparams
-    with open(args.hparams_file, "r", encoding="utf-8") as f:
-        hparams = load_hyperpyyaml(f)
+    # Tokenizer args
+    parser.add_argument("--tokenizer_type", type=str, default="char",
+                        choices=["char", "spm"],
+                        help="Type of tokenizer to use.")
+    parser.add_argument("--spm_model", type=str, default=None,
+                        help="Path to SentencePiece model file (if tokenizer_type is 'spm').")
 
-    # Tokenizer
-    label_encoder = make_tokenizer(args.tokenizer_type, args.spm_model)
+    # PEFT args
+    parser.add_argument("--peft", type=str, default="none",
+                        choices=["none", "lora"],
+                        help="Parameter-Efficient Finetuning method.")
+    parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank.")
+    parser.add_argument("--lora_alpha", type=int, default=16,
+                        help="LoRA alpha.")
+    parser.add_argument("--lora_dropout", type=float, default=0.05,
+                        help="LoRA dropout.")
 
-    # --- build ordered vocab list and lock size ---
-    ind2lab = label_encoder.ind2lab
-    if isinstance(ind2lab, dict):
-        # SB 1.x: dict mapping index -> symbol
-        vocab_list = [ind2lab[i] for i in range(len(ind2lab))]
+    # Logging & meta args
+    parser.add_argument("--run_id", type=str,
+                        default=f"sb_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                        help="Unique ID for the run.")
+    parser.add_argument("--run_stage", type=str, default="train",
+                        help="Stage of the run (e.g., 'train', 'test').")
+    parser.add_argument("--metrics_csv", type=str, default=None,
+                        help="Path to master CSV for logging sweep results.")
+    parser.add_argument("--notes", type=str, default="",
+                        help="Optional notes for the run.")
+    parser.add_argument("--save_full_model", action="store_true",
+                        help="Save the full model state_dict, not just the checkpointer.")
+    parser.add_argument("--language", type=str, default="en",
+                        help="Language of the dataset.")
+    parser.add_argument("--task", type=str, default="asr", help="Task type.")
+    parser.add_argument("--eval_strategy", type=str, default="epoch",
+                        choices=["epoch", "steps"], help="Evaluation strategy.")
+    parser.add_argument("--eval_steps", type=int, default=1000,
+                        help="Evaluation frequency in steps (if eval_strategy is 'steps').")
+
+    args = parser.parse_args()
+
+    # Define output directory and overrides
+    output_dir = Path(
+        f"finetuned_models/speechbrain/{args.model_name}_{args.run_id}")
+    overrides = {"output_folder": str(output_dir)}
+
+    # Create experiment directory, passing overrides to resolve YAML references
+    sb.create_experiment_directory(
+        experiment_directory=output_dir,
+        hyperparams_to_save=args.hparams_file,
+        overrides=overrides,
+    )
+    setup_logging(output_dir / "train_log.txt")
+
+    # Load hyperparameters with overrides
+    with open(args.hparams_file) as fin:
+        hparams = load_hyperpyyaml(fin, overrides)
+
+    # Override hparams with command-line arguments
+    hparams.update(vars(args))
+
+    # Set seed for reproducibility
+    seed_everything(args.seed)
+    torch.backends.cudnn.deterministic = True
+
+    # Create tokenizer
+    if args.tokenizer_type == "char":
+        tokenizer = create_char_tokenizer()
+        hparams["tokenizer"] = tokenizer
+        vocab_size = len(tokenizer)
+        hparams["output_neurons"] = vocab_size
+        tokenizer.expect_len(vocab_size)
+    elif args.tokenizer_type == "spm":
+        if not args.spm_model:
+            raise ValueError("--spm_model is required for tokenizer_type 'spm'")
+        hparams["tokenizer"] = SentencePiece(
+            model_dir=Path(args.spm_model).parent,
+            vocab_size=hparams["output_neurons"])
     else:
-        # already a list/tuple
-        vocab_list = list(ind2lab)
+        raise ValueError(f"Unsupported tokenizer_type: {args.tokenizer_type}")
 
-    # Silence the expect_len warning and lock the encoder size
-    label_encoder.expect_len(len(vocab_list))
+    # Data IO
+    train_data, valid_data, test_data = dataio_prepare(hparams,
+                                                       hparams["tokenizer"])
+    hparams[
+        "valid_set"] = valid_data  # Pass validation set to Brain for step-based eval
 
-    # --- build beam searcher with correct types ---
-    space_token = " " if " " in vocab_list else vocab_list[
-        0]  # must be a STRING that's in vocab_list
-    hparams["ctc_beam_searcher"] = CTCBeamSearcher(
-        blank_index=label_encoder.get_blank_index(),
-        vocab_list=vocab_list,  # LIST[str], not dict
-        space_token=space_token,  # STRING, not index
-        beam_size=args.beam_size,
-    )
-
-    # Datasets
-    train_ds, valid_ds, test_ds = load_datasets(args.train_manifest, args.valid_manifest, args.test_manifest, label_encoder, args.train_subset)
-
-    # Feature pipeline and model
-    modules, hparams = build_model_from_hparams(hparams, label_encoder)
-
-    # Build beam searcher _after_ we know the vocab
-    space_index = label_encoder.ind2lab.index(" ") if " " in label_encoder.ind2lab else -1
-    hparams["ctc_beam_searcher"] = CTCBeamSearcher(
-        blank_index=label_encoder.get_blank_index(),
-        vocab_list=label_encoder.ind2lab,
-        space_token=space_index,
-        beam_size=args.beam_size,
-    )
-
-    # LoRA injection if requested
+    # Model and Brain
+    model = build_asr_model(hparams)
     if args.peft == "lora":
-        inject_lora_adapters(modules, r=args.lora_r, alpha=args.lora_alpha, dropout=args.lora_dropout)
+        model = inject_lora(model, r=args.lora_r, alpha=args.lora_alpha,
+                            dropout=args.lora_dropout)
 
-    # Brain
-    train_logger = sb.utils.train_logger.FileTrainLogger(save_file=os.path.join(run_dir, "train_log.txt"))
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    gpu_name = torch.cuda.get_device_name(0) if device == "cuda" else None
+    # Manually update the epoch counter limit from the parsed arguments
+    hparams["epoch_counter"].limit = args.epochs
 
-    brain = ASRBrain(modules=modules,
-                     opt_class=lambda x: torch.optim.AdamW(x, lr=args.lr),
-                     hparams={**hparams, "label_encoder": label_encoder, "train_logger": train_logger,
-                              "val_beam_size": args.beam_size, "_last_train_loss": None, "_last_valid_loss": None},
-                     run_opts={"device": device, "auto_mix_prec": True},
-                     checkpointer=sb.utils.checkpoints.Checkpointer(run_dir, recoverables=modules))
+    asr_brain = ASR(
+        modules={
+            "model": model,
+            "ctc_lin": hparams["ctc_lin"],
+            "input_linear": hparams["input_linear"]
+        },
+        opt_class=lambda params: AdamW(params, lr=args.lr),
+        hparams=hparams,
+        run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"},
+        checkpointer=hparams["checkpointer"],
+    )
 
-    # Samplers and loaders (dynamic length-based batching)
-    train_sampler = DynamicBatchSampler(train_ds, dynamic_items=["sig"], max_batch_len=args.batch_size * 16000 * 10)
-    train_loader = sb.dataio.dataloader.SaveableDataLoader(train_ds, batch_size=None, sampler=train_sampler)
-    valid_loader = sb.dataio.dataloader.SaveableDataLoader(valid_ds, batch_size=1)
+    # Pass grad_accum to Brain
+    asr_brain.hparams.grad_accum_steps = args.grad_accum
 
-    # Train
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-    t0 = time.time()
-    brain.fit(epoch_counter=range(1, args.epochs + 1),
-              train_set=train_loader,
-              valid_set=valid_loader,
-              train_loader_kwargs={"drop_last": True},
-              valid_loader_kwargs={})
-    train_time = time.time() - t0
+    # Determine validation set for fit method
+    fit_valid_set = None if args.eval_strategy == "steps" else valid_data
+
+    # Training
+    logger.info(f"Starting training run: {args.run_id}")
+    start_time = time.time()
+    asr_brain.fit(
+        epoch_counter=asr_brain.hparams.epoch_counter,
+        train_set=train_data,
+        valid_set=fit_valid_set,
+        train_loader_kwargs=hparams["dataloader_opts"],
+        valid_loader_kwargs=hparams["dataloader_opts"],
+    )
+    train_runtime = time.time() - start_time
+
+    # Evaluation
+    test_wer = -1
+    if not args.skip_test and test_data:
+        logger.info("Running final evaluation on the test set...")
+        asr_brain.hparams.wer_file = output_dir / "wer_test_stats.txt"
+        asr_brain.evaluate(
+            test_data,
+            min_key="WER",
+            test_loader_kwargs=hparams["dataloader_opts"],
+        )
+        test_wer = asr_brain.test_stats["WER"]
 
     # Save artifacts
-    brain.checkpointer.save_checkpoint(meta={"run_dir": run_dir})
-    save_model_card(run_dir, args, hparams)
+    if args.save_full_model:
+        torch.save(model.state_dict(), output_dir / "model_state.pt")
 
-    # Evaluate on valid and test
-    t_inf0 = time.time()
-    valid_wer = sb.utils.data_utils.to_float(compute_wer(brain, valid_ds, label_encoder, beam_size=args.beam_size))
-    inference_time = time.time() - t_inf0
+    # Save tokenizer
+    tokenizer_path = output_dir / "tokenizer.json"
+    hparams["tokenizer"].save(tokenizer_path)
+    logger.info(f"Tokenizer saved to {tokenizer_path}")
 
-    test_wer = None
-    if (args.test_manifest is not None) and (not args.skip_test):
-        test_wer = sb.utils.data_utils.to_float(compute_wer(brain, test_ds, label_encoder, beam_size=args.beam_size))
+    save_model_card(output_dir, hparams)
 
-    peak_mem_mb = None
-    if torch.cuda.is_available():
-        peak_mem_mb = round(torch.cuda.max_memory_allocated() / (1024 ** 2), 1)
-
-    # Build sweep-compatible record
-    record = {
-        "timestamp": ts,
-        "run_id": run_id,
+    # Log metrics
+    peak_memory = get_peak_memory_mb()
+    metrics = {
+        "timestamp": datetime.now().isoformat(),
+        "run_id": args.run_id,
         "run_stage": args.run_stage,
         "model": args.model_name,
-        "output_dir": run_dir,
+        "output_dir": str(output_dir),
         "dataset_part": args.dataset_part,
-        "train_fraction": args.train_fraction,
-        "validation_samples": args.validation_samples,
+        "train_fraction": 1.0,
+        "validation_samples": len(valid_data) if valid_data else 0,
         "epochs": args.epochs,
-        "wer": valid_wer,
-        "train_runtime": round(train_time, 2),
-        "train_loss": brain.hparams._last_train_loss,
-        "eval_loss": brain.hparams._last_valid_loss,
-        "device": device,
-        "gpu": gpu_name,
-        "per_device_train_batch_size": args.batch_size,
+        "wer": test_wer,
+        "train_runtime": train_runtime,
+        "train_loss": asr_brain.train_stats["loss"],
+        "eval_loss": asr_brain.valid_stats["loss"],
+        "device": torch.cuda.get_device_name(
+            0) if torch.cuda.is_available() else "cpu",
+        "gpu": torch.cuda.device_count(),
+        "per_device_train_batch_size": hparams["dataloader_opts"]["batch_size"],
         "grad_accum": args.grad_accum,
-        "effective_batch_size": args.batch_size * args.grad_accum,
+        "effective_batch_size": hparams["dataloader_opts"][
+                                    "batch_size"] * args.grad_accum,
         "lora_r": args.lora_r if args.peft == "lora" else None,
         "lora_alpha": args.lora_alpha if args.peft == "lora" else None,
         "lora_dropout": args.lora_dropout if args.peft == "lora" else None,
-        "quant_weights_dtype": "fp32",
-        "quant_compute_dtype": "float16" if device == "cuda" else "float32",
-        "inference_time_sec": round(inference_time, 2),
-        "peak_memory_mb": peak_mem_mb,
-        "save_full_model": bool(args.save_full_model),
+        "quant_weights_dtype": None,
+        "quant_compute_dtype": None,
+        "inference_time_sec": None,
+        "peak_memory_mb": peak_memory,
+        "save_full_model": args.save_full_model,
         "language": args.language,
         "task": args.task,
         "learning_rate": args.lr,
         "seed": args.seed,
         "eval_strategy": args.eval_strategy,
         "eval_steps": args.eval_steps,
+        "notes": args.notes,
+        "git_commit_hash": get_git_commit_hash(),
     }
 
-    # Append to CSV if requested
-    if args.metrics_csv:
-        write_header = not os.path.isfile(args.metrics_csv)
-        with open(args.metrics_csv, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(record.keys()))
-            if write_header:
-                writer.writeheader()
-            writer.writerow(record)
+    with open(output_dir / "metrics.json", "w") as f:
+        json.dump(metrics, f, indent=4)
 
-    # Always dump JSON in run dir
-    with open(os.path.join(run_dir, "metrics.json"), "w", encoding="utf-8") as jf:
-        json.dump(record, jf, indent=2)
+    if args.metrics_csv:
+        csv_path = Path(args.metrics_csv)
+        is_new_file = not csv_path.exists()
+        metrics_df = pd.DataFrame([metrics])
+        metrics_df.to_csv(csv_path, mode='a', header=is_new_file, index=False)
+
+    logger.info(f"Training complete. Artifacts saved to {output_dir}")
+    log_gpu_memory("Final GPU Memory")
 
 
 if __name__ == "__main__":

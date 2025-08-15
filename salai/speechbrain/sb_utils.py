@@ -1,82 +1,126 @@
-import os
+# salai/asr_finetune/speechbrain/sb_utils.py
+"""
+Utility functions for the SpeechBrain ASR pipeline, including model
+creation, tokenizer setup, and LoRA injection.
+"""
+
 import json
-from typing import Dict, Tuple
-
 import torch
-import torch.nn as nn
-import speechbrain as sb
+import logging
+from pathlib import Path
+from speechbrain.dataio.encoder import CTCTextEncoder
+
+logger = logging.getLogger(__name__)
 
 
-class LoRALinear(nn.Module):
-    """A simple LoRA wrapper for Linear layers.
-    W(x) + scale * B(A(x)), where A is down rank r and B is up rank r.
-    Base weight W is frozen when LoRA is enabled.
+def build_asr_model(hparams):
+    """Builds the ASR model from hyperparameters."""
+    model = hparams["model"]
+    return model
+
+
+def save_model_card(output_dir: Path, hparams: dict):
+    """Saves a simple model card to the output directory."""
+    card_content = {
+        "model_name": hparams.get("model_name", "speechbrain-conformer-ctc"),
+        "speechbrain_version": ">=1.0.0",
+        "base_model": "ConformerEncoder",
+        "dataset": hparams.get("dataset_part"),
+        "language": hparams.get("language", "en"),
+        "task": hparams.get("task", "asr"),
+        "training_params": {
+            "epochs": hparams.get("epochs"),
+            "learning_rate": hparams.get("lr"),
+            "batch_size": hparams.get("batch_size"),
+            "grad_accum": hparams.get("grad_accum"),
+        },
+    }
+    card_path = output_dir / "model_card.json"
+    with open(card_path, "w") as f:
+        json.dump(card_content, f, indent=4)
+    logger.info(f"Model card saved to {card_path}")
+
+
+def create_char_tokenizer():
     """
-    def __init__(self, base: nn.Linear, r: int = 32, alpha: int = 64, dropout: float = 0.05):
+    Creates a CTCTextEncoder for character-level tokenization.
+    """
+    # Define the character set as per the project brief
+    char_set = [" "] + list("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789./")
+
+    tokenizer = CTCTextEncoder(symbols=char_set)
+
+    # Add an <unk> token to handle any character that might slip through
+    # normalization. This is good practice.
+    tokenizer.add_unk()
+
+    return tokenizer
+
+
+class LoRALinear(torch.nn.Module):
+    """ LoRA-adapted Linear layer. """
+
+    def __init__(self, linear_layer, r, alpha, dropout):
         super().__init__()
-        self.base = base
-        self.r = r
-        self.alpha = alpha
+        self.in_features = linear_layer.in_features
+        self.out_features = linear_layer.out_features
+
+        self.lora_A = torch.nn.Linear(self.in_features, r, bias=False)
+        self.lora_B = torch.nn.Linear(r, self.out_features, bias=False)
         self.scaling = alpha / r
-        self.A = nn.Linear(base.in_features, r, bias=False)
-        self.B = nn.Linear(r, base.out_features, bias=False)
-        self.dropout = nn.Dropout(dropout)
-        # Freeze base
-        for p in self.base.parameters():
-            p.requires_grad = False
-        # Init A,B small
-        nn.init.kaiming_uniform_(self.A.weight, a=5 ** 0.5)
-        nn.init.zeros_(self.B.weight)
+        self.dropout = torch.nn.Dropout(p=dropout)
+
+        # Freeze the original layer
+        self.original_layer = linear_layer
+        self.original_layer.weight.requires_grad = False
+        if self.original_layer.bias is not None:
+            self.original_layer.bias.requires_grad = False
+
+        # Initialize LoRA weights
+        torch.nn.init.kaiming_uniform_(self.lora_A.weight, a=5 ** 0.5)
+        torch.nn.init.zeros_(self.lora_B.weight)
 
     def forward(self, x):
-        return self.base(x) + self.dropout(self.B(self.A(x))) * self.scaling
+        original_output = self.original_layer(x)
+        lora_output = self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
+        return original_output + lora_output
 
 
-def build_model_from_hparams(hparams: Dict, label_encoder=None) -> Tuple[Dict[str, nn.Module], Dict]:
-    # Build modules defined in YAML-like dict hparams
-    compute_features = hparams["compute_features"]
-    normalize = hparams["normalize"]
-    specaug = hparams.get("specaug")
-    encoder = hparams["encoder"]
-    ctc_lin = hparams["ctc_lin"]
+def inject_lora(model, r, alpha, dropout):
+    """
+    Injects LoRA layers into the specified layers of the Conformer model.
+    This function specifically targets the Linear layers within the attention
+    and feed-forward modules of each Conformer block.
+    """
+    logger.info(
+        f"Injecting LoRA layers with r={r}, alpha={alpha}, dropout={dropout}")
 
-    # If label encoder is known, adjust output size of ctc_lin
-    if label_encoder is not None and isinstance(ctc_lin, nn.Linear):
-        vocab_size = len(label_encoder.ind2lab)
-        ctc_lin = nn.Linear(ctc_lin.in_features, vocab_size)
+    for layer in model.modules():
+        if isinstance(layer, torch.nn.ModuleList):
+            for conformer_block in layer:
+                # Target Linear layers in MultiheadAttention and PositionwiseFeedForward
+                if hasattr(conformer_block, 'mha') and hasattr(
+                        conformer_block.mha, 'W_q'):
+                    conformer_block.mha.W_q = LoRALinear(
+                        conformer_block.mha.W_q, r, alpha, dropout)
+                    conformer_block.mha.W_k = LoRALinear(
+                        conformer_block.mha.W_k, r, alpha, dropout)
+                    conformer_block.mha.W_v = LoRALinear(
+                        conformer_block.mha.W_v, r, alpha, dropout)
 
-    modules = {
-        "compute_features": compute_features,
-        "normalize": normalize,
-        "specaug": specaug,
-        "encoder": encoder,
-        "ctc_lin": ctc_lin,
-    }
-    # Put modules into CUDA if available happens in Brain run_opts
-    return modules, hparams
+                if hasattr(conformer_block, 'ffn') and hasattr(
+                        conformer_block.ffn, 'ffn'):
+                    # The FFN is a Sequential module, we need to find the Linear layers inside
+                    for i, ffn_layer in enumerate(conformer_block.ffn.ffn):
+                        if isinstance(ffn_layer, torch.nn.Linear):
+                            conformer_block.ffn.ffn[i] = LoRALinear(ffn_layer,
+                                                                    r, alpha,
+                                                                    dropout)
 
+    # Unfreeze only LoRA parameters
+    for name, param in model.named_parameters():
+        if 'lora_' in name:
+            param.requires_grad = True
 
-def inject_lora_adapters(modules: Dict[str, nn.Module], r: int, alpha: int, dropout: float):
-    def wrap_linear(module: nn.Module):
-        for name, child in list(module.named_children()):
-            if isinstance(child, nn.Linear):
-                setattr(module, name, LoRALinear(child, r=r, alpha=alpha, dropout=dropout))
-            else:
-                wrap_linear(child)
-    # Target attention and feedforward blocks in encoder
-    wrap_linear(modules["encoder"])  # broad approach, safe and simple
-
-
-def save_model_card(run_dir: str, args, hparams: Dict):
-    card = {
-        "engine": "speechbrain",
-        "model": args.model_name,
-        "tokenizer_type": args.tokenizer_type,
-        "peft": args.peft,
-        "lora_r": args.lora_r,
-        "lora_alpha": args.lora_alpha,
-        "lora_dropout": args.lora_dropout,
-        "hparams_file": args.hparams_file,
-    }
-    with open(os.path.join(run_dir, "model_card.json"), "w", encoding="utf-8") as f:
-        json.dump(card, f, indent=2)
+    logger.info("LoRA injection complete.")
+    return model

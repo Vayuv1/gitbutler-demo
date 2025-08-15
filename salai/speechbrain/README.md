@@ -1,226 +1,64 @@
-# SpeechBrain Finetuning on ATC0 (Conformer‑CTC)
+SpeechBrain ASR Finetuning PipelineThis directory contains a robust, production-ready pipeline for finetuning Conformer-CTC Automatic Speech Recognition (ASR) models using SpeechBrain 1.x. The pipeline is designed to be consistent with the UX, artifacts, and evaluation metrics of the existing Whisper-based pipeline.1. Environment SetupThis project uses uv for dependency management.Install uv:If you don't have uv, install it via pip:pip install uv
+Create and Sync the Virtual Environment:From the root of the salai repository, run the following commands to create a virtual environment and install the required dependencies.# Create a virtual environment named .venv
+uv venv
 
-This package provides a **SpeechBrain** implementation for fine‑tuning a Conformer‑CTC ASR model on the **ATC0** dataset. It mirrors the UX of your Whisper scripts while following SpeechBrain best practices and keeping the outputs compatible with your sweep/summary tooling.
+# Activate the environment
+source .venv/bin/activate
 
----
-## 0) Requirements
-- Python 3.10+
-- GPU with CUDA (recommended) and at least ~12 GB VRAM for the baseline
-- PyTorch + torchaudio, SpeechBrain, HyperPyYAML, datasets, python‑dotenv, soundfile, sentencepiece (optional)
-
-Install (example):
-```bash
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
-pip install speechbrain hyperpyyaml datasets python-dotenv soundfile sentencepiece
-```
-
----
-## 1) File overview
-- **`train_sb.py`** — main trainer. Builds tokenizer & datasets from manifests, constructs Conformer from `hparams_sb.yaml`, optional LoRA, trains with AMP, evaluates WER, logs metrics, saves checkpoints.
-- **`decode_sb.py`** — offline decoder. Loads a checkpoint and produces `decode.jsonl` hypotheses for a given manifest.
-- **`hparams_sb.yaml`** — model/feature hyper‑parameters (Fbank, SpecAugment, Conformer shape, CTC loss/beam).
-- **`sb_utils.py`** — helpers: LoRA wrapper for Linear layers, model builder, model card writer.
-- **`../common/text_norm.py`** — ATC‑friendly normalization (UPPERCASE, digits kept, only `.` and `/`).
-- **`../common/metrics.py`** — WER computation (greedy/beam) using SpeechBrain’s metrics.
-- **`../data_prep/atc0_hf_to_manifests.py`** — converts **HF‑SaLAI/salai_atc0** to local WAVs + CSV manifests.
-
-Folder convention for outputs:
-```
-salai/finetuned_models/speechbrain/<model_name>_<YYYYmmdd_HHMMSS>/
-  checkpoints/   train_log.txt   metrics.json   model_card.json
-```
-
----
-## 2) Data preparation (one‑time)
-**Why manifests?** Stable file paths, one‑time normalization, 16 kHz mono, engine‑agnostic I/O, faster epochs, and reproducibility.
-
-**Create manifests/WAVs**
-```bash
-export HUGGINGFACE_TOKEN=***your_token***
-python asr_finetune/data_prep/atc0_hf_to_manifests.py --config base --out_dir data/atc0
-# quick sanity subset
-python asr_finetune/data_prep/atc0_hf_to_manifests.py --config base --out_dir data/atc0 \
-  --train_fraction 0.1 --validation_samples 200
-```
-Outputs:
-```
-data/atc0/base/train.csv   valid.csv   test.csv
-```
-Each CSV row has: `id, wav, duration, transcript`.
-
-**Script flags** (`atc0_hf_to_manifests.py`):
-- `--config` (base | part2 | part3) — which ATC0 configuration to export.
-- `--out_dir` — root folder to write audio + manifests (default `data/atc0`).
-- `--train_fraction` — use first fraction of train split (0<val≤1.0). Useful for small test runs.
-- `--validation_samples` — cap number of validation items (0 means all).
-
-> Tip: To *merge* `part2` / `part3` into training, run the script for each config, then concatenate their `train.csv` files into a single manifest.
-
----
-## 3) Training — `train_sb.py`
-Runs a baseline Conformer‑CTC with AMP and optional LoRA. Compatible with your sweep CSV when `--metrics_csv` is provided.
-
-### Minimal example
-```bash
-python asr_finetune/speechbrain/train_sb.py \
-  --train_manifest data/atc0/base/train.csv \
-  --valid_manifest data/atc0/base/valid.csv \
-  --test_manifest  data/atc0/base/test.csv \
-  --output_dir salai/finetuned_models/speechbrain \
-  --dataset_part base --epochs 5 --lr 1e-3 \
-  --batch_size 8 --grad_accum 1 --beam_size 8 \
-  --notes "SB baseline ATC0 base"
-```
-
-### Flags (by group)
-**Data**
-- `--train_manifest` — path to train CSV/JSONL.
-- `--valid_manifest` — path to validation CSV/JSONL.
-- `--test_manifest` — path to test CSV/JSONL (optional).
-- `--output_dir` — base directory for run folders and checkpoints.
-- `--dataset_part` — short label stored in metrics (e.g., `base`, `part2`).
-- `--train_fraction` — recorded in metrics for parity with Whisper sweeps (no slicing occurs here; slicing is done by data prep).
-- `--validation_samples` — recorded in metrics (no slicing occurs here; slicing is done by data prep).
-- `--train_subset` — **runtime** sampler for quick iterations (uses only the first N rows of the train manifest).
-- `--skip_test` — compute only validation WER; skip test.
-
-**Optimization**
-- `--epochs` — number of epochs.
-- `--lr` — learning rate (AdamW).
-- `--batch_size` — target batch size used by a **dynamic length‑based** sampler.
-- `--grad_accum` — accumulation steps to reach a desired effective batch size.
-- `--seed` — random seed.
-
-**Model**
-- `--model_name` — free‑form tag written into the run folder/CSV (e.g., `sb-conformer-ctc`).
-- `--hparams_file` — path to `hparams_sb.yaml`.
-
-**Tokenizer**
-- `--tokenizer_type` — `char` (default) or `spm`.
-- `--spm_model` — path to a SentencePiece model when `--tokenizer_type spm`.
-
-**PEFT (LoRA)**
-- `--peft` — `none` (default) or `lora`.
-- `--lora_r` — LoRA rank.
-- `--lora_alpha` — LoRA scaling.
-- `--lora_dropout` — LoRA dropout.
-
-**Decoding**
-- `--beam_size` — beam width for CTC decoding in evaluation (use 1 for greedy).
-- `--lm_weight` — reserved; external LM not used in the baseline.
-
-**Logging / meta**
-- `--run_id` — custom identifier (default is timestamp `YYYYmmdd_HHMMSS`).
-- `--run_stage` — e.g., `single`, `coarse`, `refine` (recorded in CSV).
-- `--metrics_csv` — if provided, append one row using the **same header** as your Whisper sweeps (see §5).
-- `--notes` — free text saved in `metrics.json` (not written to CSV).
-- `--save_full_model` — boolean flag recorded in CSV (baseline saves checkpoints regardless).
-- `--language`, `--task` — recorded for parity with Whisper.
-- `--eval_strategy`, `--eval_steps` — recorded for parity with Whisper sweeps.
-
-### Outputs per run
-- `train_log.txt` — SpeechBrain training log
-- `checkpoints/` — SB Checkpointer artifacts
-- `metrics.json` — one JSON with WER, timings, memory, and flags for this run
-- `model_card.json` — minimal card with engine/model/tokenizer/PEFT info
-
----
-## 4) Decoding — `decode_sb.py`
-Produces per‑utterance hypotheses for a manifest using a saved checkpoint.
-
-**Example**
-```bash
-python asr_finetune/speechbrain/decode_sb.py \
-  --hparams_file asr_finetune/speechbrain/hparams_sb.yaml \
-  --checkpoint_dir salai/finetuned_models/speechbrain/sb-conformer-ctc_YYYYmmdd_HHMMSS \
-  --manifest data/atc0/base/test.csv \
-  --beam_size 8
-```
-**Flags**
-- `--hparams_file` — YAML to reconstruct features/model.
-- `--checkpoint_dir` — run directory containing SB checkpoints.
-- `--manifest` — CSV/JSONL with `id,wav,duration,transcript`.
-- `--beam_size` — beam width (1 = greedy).
-
-**Output**
-- `decode.jsonl` in `checkpoint_dir`, lines like: `{ "id": "...", "hyp": "..." }`.
-
----
-## 5) CSV compatibility (sweep/summary)
-When `--metrics_csv` is provided to **`train_sb.py`**, the trainer appends **exactly** the Whisper sweep header:
-```
-timestamp, run_id, run_stage, model, output_dir, dataset_part, train_fraction, validation_samples,
-epochs, wer, train_runtime, train_loss, eval_loss, device, gpu, per_device_train_batch_size,
-grad_accum, effective_batch_size, lora_r, lora_alpha, lora_dropout, quant_weights_dtype,
-quant_compute_dtype, inference_time_sec, peak_memory_mb, save_full_model, language, task,
-learning_rate, seed, eval_strategy, eval_steps
-```
-Fill‑ins for SpeechBrain baseline:
-- `quant_weights_dtype` = `fp32`
-- `quant_compute_dtype` = `float16` on GPU (AMP) or `float32` on CPU
-- `wer` = validation WER
-- `inference_time_sec` = time to compute validation WER after training
-- `peak_memory_mb` = CUDA peak allocated memory
-
-> For single runs where you do **not** want to write the master CSV, simply omit `--metrics_csv`. You will still get `metrics.json` in the run folder.
-
----
-## 6) Hyper‑parameters — `hparams_sb.yaml`
-Main blocks:
-- **Features** — 80‑mel Fbank at 16 kHz, 25 ms window / 10 ms hop.
-- **Normalization** — global CMVN.
-- **SpecAugment** — frequency/time masking (disable or tune as needed).
-- **Model** — Conformer encoder (12 layers, d_model=256, heads=4, dropout=0.1). Adjust for your GPU.
-- **CTC head/loss** — Linear to vocab size (auto‑resized from tokenizer), CTC loss with blank index 0.
-- **CTCBeamSearcher** — used for validation decoding (beam size set here, overridden by `--beam_size`).
-
-> Later, you can add streaming knobs (chunk size, left/right context) to the YAML and surface them via flags.
-
----
-## 7) LoRA details
-- Enabled via `--peft lora` with `--lora_r`, `--lora_alpha`, `--lora_dropout`.
-- Injected broadly into **Linear layers inside the Conformer encoder** to keep it simple and robust. You can narrow targets after profiling.
-- Baseline recommendation: first run **full fine‑tune** (no PEFT) to validate pipeline, then enable LoRA.
-
----
-## 8) Examples
-**Baseline with CSV logging**
-```bash
-python asr_finetune/speechbrain/train_sb.py \
-  --train_manifest data/atc0/base/train.csv \
-  --valid_manifest data/atc0/base/valid.csv \
-  --test_manifest  data/atc0/base/test.csv \
-  --output_dir salai/finetuned_models/speechbrain \
-  --dataset_part base --epochs 5 --lr 1e-3 \
-  --batch_size 8 --grad_accum 4 --beam_size 8 \
-  --metrics_csv asr_finetune/sweep_runs/sweep_master.csv \
-  --notes "SB baseline ATC0 base"
-```
-**LoRA run**
-```bash
-python asr_finetune/speechbrain/train_sb.py ... \
-  --peft lora --lora_r 32 --lora_alpha 64 --lora_dropout 0.05
-```
-**Quick sanity** (no CSV, small subset)
-```bash
-python asr_finetune/speechbrain/train_sb.py ... \
-  --train_subset 500 --skip_test --notes "smoke test"
-```
-**SentencePiece tokenizer**
-```bash
-python asr_finetune/speechbrain/train_sb.py ... \
-  --tokenizer_type spm --spm_model path/to/model.spm
-```
-
----
-## 9) Troubleshooting
-- **HF token** — ensure `HUGGINGFACE_TOKEN` (or `HF_TOKEN`) is set before data prep.
-- **CUDA OOM** — lower `--batch_size`, raise `--grad_accum`, or reduce model size in YAML.
-- **WER oddities** — confirm the same normalization across engines. This repo’s `text_norm.py` uppercases, keeps digits, and only permits `.` and `/`.
-- **Slow epochs** — manifests avoid on‑the‑fly decoding; still, you can use `--train_subset` to iterate faster.
-
----
-## 10) Repro tips
-- Record the exact git commit and `metrics.json` alongside the run folder.
-- Fix seeds (`--seed`) and avoid changing `text_norm.py` mid‑project to keep WER comparable.
-- Keep a global `sweep_master.csv` and let single runs opt‑in via `--metrics_csv`.
+# Install dependencies from requirements.txt
+# (Assuming you have a requirements.txt with speechbrain, pandas, etc.)
+uv pip install -r requirements.txt 
+Note: Ensure your requirements.txt includes speechbrain>=1.0.0,<1.1, torch, torchaudio, pandas, and hyperpyyaml.2. Data PreparationThe pipeline expects data to be in a specific format: a directory of 16 kHz mono WAV files and a corresponding manifest CSV file.Run the Data Prep Script:Use the existing atc0_hf_to_manifests.py script to download the ATC0 dataset from Hugging Face and convert it into the required format.python -m asr_finetune.data_prep.atc0_hf_to_manifests \
+    --output_dir data/atc0_manifests \
+    --wav_output_dir data/atc0_wavs \
+    --dataset_name "HF-SaLAI/salai_atc0" \
+    --hf_token "YOUR_HF_TOKEN"
+This will create manifest files (e.g., train.csv, validation.csv, test.csv) and a directory with all the audio files.3. TrainingThe train_sb.py script is the main entry point for training and finetuning models.Baseline Training RunThis command runs a standard training job on the base dataset part for 15 epochs.python -m asr_finetune.speechbrain.train_sb \
+    --hparams_file asr_finetune/speechbrain/hparams_sb.yaml \
+    --train_manifest data/atc0_manifests/base_train.csv \
+    --valid_manifest data/atc0_manifests/base_validation.csv \
+    --test_manifest data/atc0_manifests/base_test.csv \
+    --dataset_part "base" \
+    --model_name "conformer-ctc-base-finetune" \
+    --epochs 15 \
+    --lr 1e-4 \
+    --batch_size 16 \
+    --grad_accum 2
+LoRA Finetuning RunTo finetune using LoRA, simply add the --peft lora flag and configure the LoRA parameters.python -m asr_finetune.speechbrain.train_sb \
+    --hparams_file asr_finetune/speechbrain/hparams_sb.yaml \
+    --train_manifest data/atc0_manifests/base_train.csv \
+    --valid_manifest data/atc0_manifests/base_validation.csv \
+    --test_manifest data/atc0_manifests/base_test.csv \
+    --dataset_part "base" \
+    --model_name "conformer-ctc-lora-finetune" \
+    --epochs 10 \
+    --lr 5e-4 \
+    --batch_size 16 \
+    --grad_accum 2 \
+    --peft "lora" \
+    --lora_r 16 \
+    --lora_alpha 32
+Logging to a Sweep CSVTo aggregate results from multiple runs (e.g., for hyperparameter sweeps), use the --metrics_csv flag. The script will append a new row with all the run's metrics and configurations to the specified file.python -m asr_finetune.speechbrain.train_sb \
+    --train_manifest ... \
+    --valid_manifest ... \
+    --metrics_csv sweep_runs/speechbrain_sweep.csv
+Sanity Check RunFor a quick test to ensure the pipeline is working, use the --train_subset flag to run on a small number of examples for just one epoch.python -m asr_finetune.speechbrain.train_sb \
+    --hparams_file asr_finetune/speechbrain/hparams_sb.yaml \
+    --train_manifest data/atc0_manifests/base_train.csv \
+    --valid_manifest data/atc0_manifests/base_validation.csv \
+    --dataset_part "base_subset" \
+    --model_name "sanity-check" \
+    --epochs 1 \
+    --train_subset 200 \
+    --skip_test
+4. DecodingThe decode_sb.py script runs inference with a trained model checkpoint.Greedy Decodingpython -m asr_finetune.speechbrain.decode_sb \
+    --model_dir finetuned_models/speechbrain/conformer-ctc-base-finetune_... \
+    --test_manifest data/atc0_manifests/base_test.csv \
+    --output_file decodes/base_test_greedy.jsonl \
+    --beam_size 1
+Beam Search Decodingpython -m asr_finetune.speechbrain.decode_sb \
+    --model_dir finetuned_models/speechbrain/conformer-ctc-base-finetune_... \
+    --test_manifest data/atc0_manifests/base_test.csv \
+    --output_file decodes/base_test_beam5.jsonl \
+    --beam_size 5
+5. Troubleshooting Known PitfallsThis implementation has been designed to avoid the common SpeechBrain 1.x pitfalls:Augmentation: Uses the modern speechbrain.augment.augmenter.Augmenter API.Conformer Path & Output: Correctly imports speechbrain.lobes.models.transformer.Conformer.ConformerEncoder and handles its tuple output (x, attn).Dataset: Uses DynamicItemDataset with the correct data structure.Tokenizer: Uses a CharTokenizer with the blank token correctly managed at index 0.CTC Decoding: Uses SpeechBrain's built-in CTC decoders (ctc_greedy_decode and CTCBeamSearcher) which correctly handle collapsing and blank removal.

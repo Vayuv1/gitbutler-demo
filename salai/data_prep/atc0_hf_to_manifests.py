@@ -1,96 +1,118 @@
+# salai/asr_finetune/data_prep/atc0_hf_to_manifests.py
+"""
+This script downloads the ATC0 dataset from Hugging Face, converts the audio
+to 16 kHz mono WAV files, and creates CSV manifest files for training,
+validation, and testing.
+"""
 import os
-import csv
 import argparse
-import hashlib
-from pathlib import Path
-
-from datasets import load_dataset
-from dotenv import load_dotenv
-import numpy as np
-import soundfile as sf
-import torchaudio
+import pandas as pd
 import torch
-
-try:
-    from ..common.text_norm import normalize_atc_text
-except Exception:
-    import sys, pathlib
-    sys.path.append(str(pathlib.Path(__file__).resolve().parents[2]))
-    from asr_finetune.common.text_norm import normalize_atc_text
+from pathlib import Path
+from tqdm import tqdm
+from datasets import load_dataset
+import torchaudio
+from speechbrain.dataio.dataio import read_audio_info
 
 
+def process_atc0_dataset(
+        output_dir: Path,
+        wav_output_dir: Path,
+        dataset_name: str,
+        hf_token: str,
+        config: str,
+        train_fraction: float,
+        validation_samples: int,
+):
+    """
+    Downloads, processes, and creates manifests for the ATC0 dataset.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    wav_output_dir.mkdir(parents=True, exist_ok=True)
 
-def write_split(ds, out_audio_dir: Path, manifest_path: Path, split: str, resample_hz: int = 16000):
-    out_audio_dir.mkdir(parents=True, exist_ok=True)
-    with open(manifest_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["id", "wav", "duration", "transcript"])
-        w.writeheader()
-        for i, ex in enumerate(ds):
-            aud = ex["audio"]  # {'array': np.ndarray, 'sampling_rate': int}
-            arr = aud["array"].astype(np.float32)
-            sr = int(aud["sampling_rate"]) if isinstance(aud["sampling_rate"], (int, np.integer)) else 16000
-            # resample to 16 kHz mono
-            wav = torch.from_numpy(arr).unsqueeze(0)
-            if wav.dim() == 2 and wav.size(0) > 1:
-                wav = wav.mean(dim=0, keepdim=True)  # mono
-            if sr != resample_hz:
-                wav = torchaudio.functional.resample(wav, sr, resample_hz)
-                sr = resample_hz
-            wav_np = wav.squeeze(0).cpu().numpy().astype(np.float32)
-            text = normalize_atc_text(ex.get("text", ""))
-            # make a stable id
-            raw_id = ex.get("id") or f"{split}-{i}"
-            h = hashlib.sha1(raw_id.encode("utf-8")).hexdigest()[:16]
-            wav_path = out_audio_dir / f"{split}_{h}.wav"
-            sf.write(wav_path, wav_np, sr)
-            duration = len(wav_np) / sr
-            w.writerow({
-                "id": f"{split}_{h}",
-                "wav": str(wav_path.resolve()),
-                "duration": round(duration, 3),
-                "transcript": text,
+    # Download dataset
+    print(f"Loading dataset '{dataset_name}' with config '{config}'...")
+    atc0 = load_dataset(dataset_name, config, use_auth_token=hf_token,
+                        trust_remote_code=True)
+
+    # Process splits
+    for split in atc0.keys():
+        print(f"Processing split: {split}...")
+
+        # Create specific output directory for wav files of the current split
+        split_wav_dir = wav_output_dir / config / f"{split}_wav"
+        split_wav_dir.mkdir(parents=True, exist_ok=True)
+
+        records = []
+        # Use enumerate to generate a unique index for each example
+        for i, example in enumerate(
+                tqdm(atc0[split], desc=f"Converting {split} audio")):
+
+            # Generate a unique, deterministic ID
+            file_id = f"{config}_{split}_{i:08d}"
+
+            audio_path = split_wav_dir / f"{file_id}.wav"
+
+            # Save audio to WAV if it doesn't exist
+            if not audio_path.exists():
+                audio_array = example["audio"]["array"]
+                sample_rate = example["audio"]["sampling_rate"]
+
+                # Convert to tensor, resample, and save
+                audio_tensor = torch.tensor(audio_array).unsqueeze(0)
+                resampler = torchaudio.transforms.Resample(
+                    orig_freq=sample_rate, new_freq=16000)
+                resampled_audio = resampler(audio_tensor)
+                torchaudio.save(audio_path, resampled_audio, 16000)
+
+            # Get audio info
+            info = read_audio_info(str(audio_path))
+
+            records.append({
+                # CORRECTED: Use 'ID' (uppercase) as required by SpeechBrain
+                "ID": file_id,
+                "duration": info.num_frames / info.sample_rate,
+                "wav": str(audio_path.resolve()),
+                "transcript": example["text"],
             })
 
-
-def main():
-    load_dotenv()
-    p = argparse.ArgumentParser()
-    p.add_argument("--config", choices=["base", "part2", "part3"], default="base")
-    p.add_argument("--out_dir", default="data/atc0")
-    p.add_argument("--train_fraction", type=float, default=1.0)
-    p.add_argument("--validation_samples", type=int, default=0)
-    args = p.parse_args()
-
-    token = os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN")
-    if token is None:
-        raise RuntimeError("Set HUGGINGFACE_TOKEN in your environment or .env file.")
-
-    ds = load_dataset("HF-SaLAI/salai_atc0", args.config, use_auth_token=True)
-
-    base_out = Path(args.out_dir) / args.config
-    base_out.mkdir(parents=True, exist_ok=True)
-
-    # Train split
-    train_ds = ds["train"]
-    if 0 < args.train_fraction < 1.0:
-        n = int(len(train_ds) * args.train_fraction)
-        train_ds = train_ds.select(range(n))
-    write_split(train_ds, base_out / "train_wav", base_out / "train.csv", split="train")
-
-    # Validation split
-    if "validation" in ds:
-        valid_ds = ds["validation"]
-        if args.validation_samples and args.validation_samples > 0:
-            valid_ds = valid_ds.select(range(min(args.validation_samples, len(valid_ds))))
-        write_split(valid_ds, base_out / "valid_wav", base_out / "valid.csv", split="valid")
-
-    # Test split
-    if "test" in ds:
-        test_ds = ds["test"]
-        write_split(test_ds, base_out / "test_wav", base_out / "test.csv", split="test")
-
-    print(f"Wrote manifests under {base_out}")
+        # Create and save manifest
+        manifest_df = pd.DataFrame(records)
+        manifest_path = output_dir / f"{config}_{split}.csv"
+        manifest_df.to_csv(manifest_path, index=False)
+        print(f"Manifest saved to {manifest_path}")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Prepare ATC0 dataset manifests.")
+
+    # Updated arguments to match the README and provide flexibility
+    parser.add_argument("--output_dir", type=str, required=True,
+                        help="Directory to save the manifest CSV files.")
+    parser.add_argument("--wav_output_dir", type=str, required=True,
+                        help="Directory to save the converted WAV files.")
+    parser.add_argument("--dataset_name", type=str,
+                        default="HF-SaLAI/salai_atc0",
+                        help="Name of the Hugging Face dataset.")
+    parser.add_argument("--hf_token", type=str, required=True,
+                        help="Your Hugging Face API token for private datasets.")
+    parser.add_argument("--config", type=str, default="base",
+                        choices=["base", "part2", "part3"],
+                        help="Dataset configuration to process.")
+    parser.add_argument("--train_fraction", type=float, default=1.0,
+                        help="Fraction of training data to use.")
+    parser.add_argument("--validation_samples", type=int, default=None,
+                        help="Number of validation samples to use.")
+
+    args = parser.parse_args()
+
+    process_atc0_dataset(
+        output_dir=Path(args.output_dir),
+        wav_output_dir=Path(args.wav_output_dir),
+        dataset_name=args.dataset_name,
+        hf_token=args.hf_token,
+        config=args.config,
+        train_fraction=args.train_fraction,
+        validation_samples=args.validation_samples,
+    )

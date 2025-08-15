@@ -1,93 +1,136 @@
-import argparse
-import os
-import json
-import time
-from typing import Optional
+# salai/asr_finetune/speechbrain/decode_sb.py
+"""
+This script performs inference with a trained SpeechBrain ASR model.
+It takes a manifest file as input and produces a decode.jsonl file with
+the model's hypotheses.
+"""
 
+import argparse
+import json
 import torch
-import torch.nn as nn
+import sys
+from pathlib import Path
+from tqdm import tqdm
 
 import speechbrain as sb
+from speechbrain.dataio.dataset import DynamicItemDataset
+from speechbrain.dataio.dataloader import SaveableDataLoader
 from hyperpyyaml import load_hyperpyyaml
+from speechbrain.dataio.encoder import CTCTextEncoder
 
-# Robust imports: work with both `python -m ...` and direct script runs
-try:
-    from .sb_utils import build_model_from_hparams
-    from ..common.text_norm import normalize_atc_text
-except Exception:
-    import sys, pathlib
-    sys.path.append(str(pathlib.Path(__file__).resolve().parents[2]))
-    from asr_finetune.speechbrain.sb_utils import build_model_from_hparams
-    from asr_finetune.common.text_norm import normalize_atc_text
+# Add project root to path for imports
+project_root = Path(__file__).resolve().parent.parent.parent
+sys.path.append(str(project_root))
+
+from asr_finetune.speechbrain.sb_utils import build_asr_model
+from asr_finetune.common.text_norm import normalize_transcript
+
+
+def dataio_prepare_decode(hparams, manifest_file):
+    """Prepares the data for decoding."""
+
+    @sb.utils.data_pipeline.takes("wav")
+    @sb.utils.data_pipeline.provides("sig")
+    def audio_pipeline(wav):
+        return sb.dataio.dataio.read_audio(wav)
+
+    dataset = DynamicItemDataset.from_csv(
+        csv_path=manifest_file,
+        replacements={"data_root": ""},
+    )
+    dataset.add_dynamic_item(audio_pipeline)
+    dataset.set_output_keys(["id", "sig"])
+    return dataset
+
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--hparams_file", required=True)
-    p.add_argument("--checkpoint_dir", required=True)
-    p.add_argument("--manifest", required=True)
-    p.add_argument("--beam_size", type=int, default=8)
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description="SpeechBrain ASR Decoding")
+    parser.add_argument("--model_dir", type=str, required=True,
+                        help="Directory of the trained model.")
+    parser.add_argument("--test_manifest", type=str, required=True,
+                        help="Path to the manifest file for decoding.")
+    parser.add_argument("--output_file", type=str, default=None,
+                        help="Path to save the decode.jsonl file. Defaults to model_dir/decode.jsonl.")
+    parser.add_argument("--beam_size", type=int, default=1,
+                        help="Beam size for decoding. 1 means greedy decoding.")
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="Device to use for inference.")
+    args = parser.parse_args()
 
-    with open(args.hparams_file, "r", encoding="utf-8") as f:
-        hparams = load_hyperpyyaml(f)
+    model_dir = Path(args.model_dir)
+    hparams_file = model_dir / "hyperparams.yaml"
+    checkpoint_dir = model_dir / "checkpoints"
+    tokenizer_file = model_dir / "tokenizer.json"
 
-    # Build model and load best checkpoint
-    modules, hparams = build_model_from_hparams(hparams, label_encoder=None)  # decoder builds its own encoder from checkpoint
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    checkpointer = sb.utils.checkpoints.Checkpointer(args.checkpoint_dir, recoverables=modules)
-    checkpointer.recover_if_possible()
+    output_file = Path(
+        args.output_file) if args.output_file else model_dir / "decode.jsonl"
 
-    # Load manifest
-    items = []
-    if args.manifest.endswith(".json") or args.manifest.endswith(".jsonl"):
-        with open(args.manifest, "r", encoding="utf-8") as f:
-            for line in f:
-                items.append(json.loads(line))
-    else:
-        import pandas as pd
-        df = pd.read_csv(args.manifest)
-        items = df.to_dict("records")
+    # Load hyperparameters and tokenizer
+    with open(hparams_file) as fin:
+        hparams = load_hyperpyyaml(fin)
 
-    # Decode greedily for simplicity here
-    from speechbrain.dataio.encoder import CategoricalEncoder
-    label_encoder = hparams.get("label_encoder")
-    if label_encoder is None:
-        # Recreate a simple char encoder if not saved
-        enc = CategoricalEncoder()
-        symbols = [" "] + [chr(c) for c in range(65, 91)] + [str(d) for d in range(10)] + [".", "/"]
-        for s in symbols:
-            enc.update_from_iterable([s])
-        enc.add_unk(); enc.add_bos_eos()
-        label_encoder = enc
+    tokenizer = CTCTextEncoder.load(tokenizer_file)
+    hparams["tokenizer"] = tokenizer
 
-    modules = {k: v.to(device) if isinstance(v, nn.Module) else v for k, v in modules.items()}
-    for m in modules.values():
-        if isinstance(m, nn.Module):
-            m.eval()
+    # Load model
+    model = build_asr_model(hparams)
+    ctc_lin = hparams["ctc_lin"]
+    input_linear = hparams["input_linear"]
 
-    hyps = []
+    # Load the best checkpoint
+    checkpointer = sb.utils.checkpoints.Checkpointer(
+        checkpoints_dir=checkpoint_dir,
+        recoverables={"model": model, "ctc_lin": ctc_lin,
+                      "input_linear": input_linear}
+    )
+    checkpointer.recover(min_key="WER")
+
+    model.to(args.device)
+    ctc_lin.to(args.device)
+    input_linear.to(args.device)
+    model.eval()
+    ctc_lin.eval()
+    input_linear.eval()
+
+    # Create dataloader
+    decode_dataset = dataio_prepare_decode(hparams, args.test_manifest)
+    dataloader = SaveableDataLoader(decode_dataset, batch_size=1, num_workers=4)
+
+    # Decoding
+    results = []
     with torch.no_grad():
-        for ex in items:
-            import torchaudio
-            sig, sr = torchaudio.load(ex["wav"])
-            if sr != 16000:
-                sig = torchaudio.functional.resample(sig, sr, 16000)
-            if sig.shape[0] > 1:
-                sig = torch.mean(sig, dim=0, keepdim=True)
-            feats = hparams["compute_features"](sig.to(device))
-            feats = hparams["normalize"](feats, torch.tensor([1.0], device=device))
-            enc_out = modules["encoder"](feats)
-            logits = modules["ctc_lin"](enc_out)
-            p_ctc = hparams["log_softmax"](logits)
-            greedy = torch.argmax(p_ctc, dim=-1)
-            hyp = label_encoder.decode_ndim(greedy)[0] if greedy.ndim > 1 else label_encoder.decode_ndim(greedy)
-            hyps.append({"id": ex["id"], "hyp": hyp})
+        for batch in tqdm(dataloader, desc="Decoding"):
+            batch = batch.to(args.device)
+            wavs, wav_lens = batch.sig
 
-    out_path = os.path.join(args.checkpoint_dir, "decode.jsonl")
-    with open(out_path, "w", encoding="utf-8") as f:
-        for h in hyps:
-            f.write(json.dumps(h) + "\n")
-    print(f"Wrote hypotheses to {out_path}")
+            feats = hparams["compute_features"](wavs)
+            feats = input_linear(feats)
+            out, _ = model(feats)
+            logits = ctc_lin(out)
+            p_ctc = torch.nn.functional.log_softmax(logits, dim=-1)
+
+            if args.beam_size > 1:
+                # Beam search decoding
+                beam_searcher = sb.decoders.ctc_beam_search.CTCBeamSearcher(
+                    vocab_list=tokenizer.lab2ind.keys(),
+                    beam_size=args.beam_size,
+                    blank_id=hparams["blank_index"],
+                )
+                hyps, _, _, _ = beam_searcher(p_ctc, wav_lens)
+                hyp = hyps[0][0]
+            else:
+                # Greedy decoding
+                predicted_tokens = torch.argmax(p_ctc, dim=-1)
+                hyp = tokenizer.decode_ndim(predicted_tokens)
+
+            results.append({"id": batch.id[0], "hyp": hyp})
+
+    # Write results to file
+    with open(output_file, "w") as f:
+        for result in results:
+            f.write(json.dumps(result) + "\n")
+
+    print(f"Decoding complete. Results saved to {output_file}")
 
 
 if __name__ == "__main__":
